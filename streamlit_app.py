@@ -1,56 +1,89 @@
+import os
+import asyncio
 import streamlit as st
-from openai import OpenAI
+from google.cloud import storage
+from reag.client import ReagClient, Document
+from google.cloud import storage
+from google.oauth2 import service_account
+import json
+import base64
 
-# Show title and description.
-st.title("💬 Chatbot")
-st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
-)
+openai_api_key = st.secrets["openai"]["OPENAI_API_KEY"]
+os.environ["OPENAI_API_KEY"] = openai_api_key
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# Decode the base64-encoded JSON
+json_content = base64.b64decode(st.secrets["gcp_credentials"]["GOOGLE_CLOUD_CREDENTIALS"]).decode("utf-8")
+service_account_info = json.loads(json_content)
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+# Create credentials and a client at the start
+credentials = service_account.Credentials.from_service_account_info(service_account_info)
+client = storage.Client(credentials=credentials)
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+def load_txt_from_gcs(bucket_name):
+    bucket = client.get_bucket(bucket_name)
+    blobs = bucket.list_blobs()
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+    merged_content = ""
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    for blob in blobs:
+        if blob.name.endswith(".txt"):
+            merged_content += blob.download_as_text() + "\n"
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+    return merged_content
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+
+# Bucket name on Google Cloud Storage
+BUCKET_NAME = "contracts_roy_drive"
+
+# Load content from the bucket (runs once)
+file_content = load_txt_from_gcs(BUCKET_NAME)
+
+def query_gpt(user_query):
+    """Asynchronous function to query the model"""
+    async def run_query():
+        async with ReagClient(model="gpt-4o-mini-2024-07-18") as client:
+            response = await client.query(user_query, documents=[Document(name="MergedDocs", content=file_content)])
+            
+            # Extract content and reasoning fields and clean formatting
+            response_text = str(response)
+            content = ""
+            reasoning = ""
+            
+            if "content=" in response_text:
+                content = response_text.split("content=")[1].split(", reasoning=")[0].strip('"')
+            if "reasoning=" in response_text:
+                reasoning = response_text.split("reasoning=")[1].split(", is_irrelevant=")[0].strip('"')
+            
+            return content.replace("\\n", "\n"), reasoning.replace("\\n", "\n")
+    
+    return asyncio.run(run_query())
+
+# Streamlit chat interface
+st.title("Document Chatbot")
+
+# Initialize chat history
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display chat history
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# User input
+user_input = st.chat_input("Ask something about the documents...")
+if user_input:
+    # Display user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    with st.chat_message("user"):
+        st.markdown(user_input)
+    
+    # Get response
+    content, reasoning = query_gpt(user_input)
+    
+    # Display formatted response
+    response_text = f"**Response:**\n\n{content}\n\n*Why this answer?*\n{reasoning}"
+    st.session_state.messages.append({"role": "assistant", "content": response_text})
+    with st.chat_message("assistant"):
+        st.markdown(response_text)
