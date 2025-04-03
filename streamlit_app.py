@@ -101,7 +101,7 @@ async def query_final(client, user_query, relevant_text):
 def query_gpt(user_query):
     """Processes the document in chunks, gathers relevant sections, and makes a final query."""
     async def run_queries():
-        text_chunks = split_text_robust(file_content, num_parts=30)
+        text_chunks = split_text_robust(file_content, num_parts=20)
         documents = [Document(name=f"Doc_part_{i}", content=chunk) for i, chunk in enumerate(text_chunks)]
 
         relevant_texts = []
